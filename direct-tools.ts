@@ -12,6 +12,23 @@ import { formatToolName, isToolExcluded } from "./types.ts";
 import { resourceNameToToolName } from "./resource-tools.ts";
 import { authenticate, supportsOAuth } from "./mcp-auth-flow.ts";
 import { formatAuthRequiredMessage } from "./utils.ts";
+import {
+  callWithAutoBackground,
+  isAutoBackgroundExempt,
+  resolveAutoBackgroundMs,
+} from "./mcp-bg-tasks.ts";
+
+type CallToolResult = import("@modelcontextprotocol/sdk/types.js").CallToolResult;
+
+/** Flatten an MCP CallToolResult's text content for a background task's stored result / notification. */
+function renderCallToolText(result: unknown): string {
+  const content = ((result as { content?: McpContent[] } | undefined)?.content ?? []) as McpContent[];
+  const text = content
+    .filter(c => c.type === "text")
+    .map(c => (c as { text: string }).text)
+    .join("\n");
+  return text || "(empty result)";
+}
 
 const BUILTIN_NAMES = new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "mcp"]);
 
@@ -351,6 +368,11 @@ export function createDirectToolExecutor(
     }
 
     let uiSession: UiSessionRuntime | null = null;
+    // When the call is routed through auto-background, in-flight accounting and
+    // UI teardown move into that path's single-shot cleanup, so the shared
+    // `finally` must not also decrement (which would happen while the call is
+    // still running in the background).
+    let callHandledByAutoBg = false;
 
     try {
       state.manager.touch(spec.serverName);
@@ -379,14 +401,42 @@ export function createDirectToolExecutor(
           })
         : null;
 
-      const resultPromise = connection.client.callTool({
-        name: spec.originalName,
-        arguments: params ?? {},
-        _meta: uiSession?.requestMeta,
+      const thresholdMs = isAutoBackgroundExempt(spec.serverName) ? 0 : resolveAutoBackgroundMs();
+      callHandledByAutoBg = true;
+      const outcome = await callWithAutoBackground({
+        serverName: spec.serverName,
+        toolName: spec.originalName,
+        thresholdMs,
+        // Raise the SDK per-request timeout above the auto-background threshold
+        // so the race — not the SDK's default 60s — governs when a slow call is
+        // detached. Exempt (threshold<=0) calls keep the SDK default.
+        call: (signal) =>
+          connection.client.callTool(
+            { name: spec.originalName, arguments: params ?? {}, _meta: uiSession?.requestMeta },
+            undefined,
+            thresholdMs > 0 ? { signal, timeout: thresholdMs + 60_000 } : { signal },
+          ),
+        renderResult: renderCallToolText,
+        cleanup: () => {
+          if (uiSession?.reused) uiSession.close();
+          state.manager.decrementInFlight(spec.serverName);
+          state.manager.touch(spec.serverName);
+        },
       });
 
-      const result = await resultPromise;
-      uiSession?.sendToolResult(result as unknown as import("@modelcontextprotocol/sdk/types.js").CallToolResult);
+      if (outcome.kind === "backgrounded") {
+        return {
+          content: [{ type: "text" as const, text: outcome.note }],
+          details: { backgrounded: true, taskId: outcome.taskId, server: spec.serverName, tool: spec.originalName },
+        };
+      }
+      if (outcome.kind === "rejected") {
+        // Reuse the shared catch below for error formatting / UI cancellation.
+        throw outcome.error;
+      }
+
+      const result = outcome.value as CallToolResult;
+      uiSession?.sendToolResult(result as unknown as CallToolResult);
 
       const mcpContent = (result.content ?? []) as McpContent[];
       const content = transformMcpContent(mcpContent);
@@ -440,11 +490,16 @@ export function createDirectToolExecutor(
         details: { error: "call_failed", server: spec.serverName },
       };
     } finally {
-      if (uiSession?.reused) {
-        uiSession.close();
+      // Auto-background owns cleanup for the callTool path (foreground settle or
+      // deferred background settle). Only run shared cleanup for the other paths
+      // (resource reads, pre-call throws).
+      if (!callHandledByAutoBg) {
+        if (uiSession?.reused) {
+          uiSession.close();
+        }
+        state.manager.decrementInFlight(spec.serverName);
+        state.manager.touch(spec.serverName);
       }
-      state.manager.decrementInFlight(spec.serverName);
-      state.manager.touch(spec.serverName);
     }
   };
 }
