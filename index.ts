@@ -8,6 +8,7 @@ import { flushMetadataCache, initializeMcp, updateStatusBar } from "./init.ts";
 import { loadMetadataCache } from "./metadata-cache.ts";
 import { executeAuthComplete, executeAuthStart, executeCall, executeConnect, executeDescribe, executeList, executeSearch, executeStatus, executeUiMessages } from "./proxy-modes.ts";
 import { getConfigPathFromArgv, truncateAtWord } from "./utils.ts";
+import { McpBackgroundTaskStore, type TaskAdapterCapableApi } from "./auto-background.ts";
 import { initializeOAuth, shutdownOAuth } from "./mcp-auth-flow.ts";
 import { createMcpDirectToolCallRenderer, renderMcpProxyToolCall, renderMcpToolResult } from "./tool-result-renderer.ts";
 
@@ -51,6 +52,10 @@ export default function mcpAdapter(pi: ExtensionAPI) {
   const earlyCache = loadMetadataCache();
   const prefix = earlyConfig.settings?.toolPrefix ?? "server";
 
+  // Shared across every direct tool executor; lazily registers a single
+  // `mcp_background` Task adapter with the host on first auto-background.
+  const backgroundStore = new McpBackgroundTaskStore();
+
   const envRaw = process.env.MCP_DIRECT_TOOLS;
   const directSpecs = envRaw === "__none__"
     ? []
@@ -74,7 +79,10 @@ export default function mcpAdapter(pi: ExtensionAPI) {
       ...(spec.loading === "eager" ? { alwaysLoad: true } : { deferLoading: true }),
       promptSnippet: truncateAtWord(spec.description, 100) || `MCP tool from ${spec.serverName}`,
       parameters: Type.Unsafe((spec.inputSchema || { type: "object", properties: {} }) as never),
-      execute: createDirectToolExecutor(() => state, () => initPromise, spec),
+      execute: createDirectToolExecutor(() => state, () => initPromise, spec, {
+        api: pi as unknown as TaskAdapterCapableApi,
+        store: backgroundStore,
+      }),
       renderCall: createMcpDirectToolCallRenderer(spec.prefixedName),
       renderResult: renderMcpToolResult,
     });

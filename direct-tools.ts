@@ -12,6 +12,13 @@ import { formatToolName, isToolExcluded } from "./types.ts";
 import { resourceNameToToolName } from "./resource-tools.ts";
 import { authenticate, supportsOAuth } from "./mcp-auth-flow.ts";
 import { formatAuthRequiredMessage } from "./utils.ts";
+import {
+  buildBackgroundNote,
+  McpBackgroundTaskStore,
+  raceAutoBackground,
+  resolveAutoBackgroundMs,
+  type TaskAdapterCapableApi,
+} from "./auto-background.ts";
 
 const BUILTIN_NAMES = new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "mcp"]);
 
@@ -283,7 +290,8 @@ type DirectToolExecute = (
 export function createDirectToolExecutor(
   getState: () => McpExtensionState | null,
   getInitPromise: () => Promise<McpExtensionState> | null,
-  spec: DirectToolSpec
+  spec: DirectToolSpec,
+  autoBackground?: { api: TaskAdapterCapableApi; store: McpBackgroundTaskStore }
 ): DirectToolExecute {
   return async function execute(_toolCallId, params) {
     let state = getState();
@@ -379,13 +387,48 @@ export function createDirectToolExecutor(
           })
         : null;
 
-      const resultPromise = connection.client.callTool({
-        name: spec.originalName,
-        arguments: params ?? {},
-        _meta: uiSession?.requestMeta,
+      // Auto-background (my-pi #1091): give the host an AbortController so a
+      // backgrounded call is stoppable via TaskStop, and race the call against
+      // the threshold. Gracefully disabled when the fork task-adapter API is
+      // absent (feature-detected) or for exempt IDE transports.
+      const abortController = new AbortController();
+      const resultPromise = connection.client.callTool(
+        {
+          name: spec.originalName,
+          arguments: params ?? {},
+          _meta: uiSession?.requestMeta,
+        },
+        undefined,
+        { signal: abortController.signal },
+      );
+
+      const canBackground = autoBackground?.store.ensureRegistered(autoBackground.api) ?? false;
+      const autoMs = canBackground
+        ? resolveAutoBackgroundMs({
+            transport: state.config.mcpServers[spec.serverName]?.transport,
+            envValue: process.env.PI_MCP_AUTO_BACKGROUND_MS,
+          })
+        : 0;
+
+      const outcome = await raceAutoBackground(resultPromise, {
+        ms: autoMs,
+        onBackground: () =>
+          autoBackground!.store.add(
+            `MCP tool "${spec.originalName}" (${spec.serverName})`,
+            () => abortController.abort(),
+          ),
+        settle: (id, status, error) => autoBackground!.store.settle(id, status, error),
       });
 
-      const result = await resultPromise;
+      if (outcome.backgrounded) {
+        const note = buildBackgroundNote(spec.originalName, outcome.taskId!, autoMs);
+        return {
+          content: [{ type: "text" as const, text: note }],
+          details: { server: spec.serverName, tool: spec.originalName, backgrounded: true, taskId: outcome.taskId },
+        };
+      }
+
+      const result = outcome.result!;
       uiSession?.sendToolResult(result as unknown as import("@modelcontextprotocol/sdk/types.js").CallToolResult);
 
       const mcpContent = (result.content ?? []) as McpContent[];

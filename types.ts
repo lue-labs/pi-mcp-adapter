@@ -291,6 +291,11 @@ export interface ServerEntry {
   // HTTP fields
   url?: string;
   headers?: Record<string, string>;
+  /**
+   * Transport kind hint. IDE-bridge transports (`sse-ide`, `ws-ide`) are
+   * exempt from auto-background (my-pi #1091) because they are interactive.
+   */
+  transport?: string;
   /** 
    * Authentication type:
    * - 'oauth' - Use OAuth 2.1 (auto-discovers endpoints, supports dynamic client registration)
