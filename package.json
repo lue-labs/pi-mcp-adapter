@@ -60,6 +60,7 @@
     "resource-tools.ts",
     "lifecycle.ts",
     "metadata-cache.ts",
+    "mcp-bg-tasks.ts",
     "host-html-template.ts",
     "ui-resource-handler.ts",
     "consent-manager.ts",
@@ -95,7 +96,7 @@
     "zod": "^3.25.0 || ^4.0.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.79.1",
+    "@earendil-works/pi-coding-agent": "^0.80.10",
     "@types/bun": "^1.0.0",
     "@types/node": "^20.0.0",
     "@types/open": "^6.2.1",

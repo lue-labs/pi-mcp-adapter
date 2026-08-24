@@ -10,6 +10,11 @@ import { executeAuthComplete, executeAuthStart, executeCall, executeConnect, exe
 import { getConfigPathFromArgv, truncateAtWord } from "./utils.ts";
 import { initializeOAuth, shutdownOAuth } from "./mcp-auth-flow.ts";
 import { createMcpDirectToolCallRenderer, renderMcpProxyToolCall, renderMcpToolResult } from "./tool-result-renderer.ts";
+import {
+  ensureMcpTaskAdapterRegistered,
+  renderMcpCompletionMessage,
+  setMcpCompletionNotifier,
+} from "./mcp-bg-tasks.ts";
 
 export default function mcpAdapter(pi: ExtensionAPI) {
   let state: McpExtensionState | null = null;
@@ -86,6 +91,28 @@ export default function mcpAdapter(pi: ExtensionAPI) {
     description: "Path to MCP config file",
     type: "string",
   });
+
+  // Wire the auto-background completion wake to pi.sendMessage and register the
+  // MCP task adapter so hung calls detached past the threshold surface a
+  // task-notification and become visible to TaskStop / TaskBackgroundList.
+  setMcpCompletionNotifier((task) => {
+    try {
+      pi.sendMessage(
+        {
+          customType: "mcp_bg_completion",
+          content: renderMcpCompletionMessage(task),
+          display: false,
+          details: { id: task.id, status: task.status, server: task.serverName, tool: task.toolName },
+        },
+        // wakeOnIdle drives a debounced continuation turn when the loop is idle;
+        // it exists on the running pi build but predates the pinned type, so cast.
+        { deliverAs: "followUp", wakeOnIdle: true } as { deliverAs: "followUp" },
+      );
+    } catch {
+      // Never let a completion wake crash the settle handler.
+    }
+  });
+  void ensureMcpTaskAdapterRegistered();
 
   pi.on("session_start", async (_event, ctx) => {
     const generation = ++lifecycleGeneration;
