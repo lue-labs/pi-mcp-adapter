@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Startup now warns when configured direct MCP tools are missing this session because metadata cache is absent, the config hash changed, or cached metadata expired. Headless and UI sessions both report the server and configured tool names when known (including a global `settings.directTools` string[]), distinguish a successful warm (restart required) from discovery/auth failure, never treat stale cache names as authoritative, and never echo raw SDK error text into the new diagnostic.
+
 ### Changed
 - Default direct MCP tools to deferred loading behind `tool_search`; set `directToolLoading: "eager"` globally or per server to opt into eager schemas.
 

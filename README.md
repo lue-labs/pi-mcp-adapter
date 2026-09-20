@@ -185,7 +185,7 @@ You can also pass only the `code` query parameter with `args: '{"code":"..."}'`.
 |---------|-------------|
 | `toolPrefix` | `"server"` (default), `"short"` (strips `-mcp` suffix), or `"none"` |
 | `idleTimeout` | Global idle timeout in minutes (default: 10, 0 to disable) |
-| `directTools` | Global default for all servers (default: false). Per-server overrides this. |
+| `directTools` | Global default for all servers: `true`, `false`, or a tool-name `string[]` (default: false). Per-server overrides this. |
 | `directToolLoading` | Global loading policy for direct tools: `"deferred"` default, or `"eager"`. Per-server overrides this. |
 | `disableProxyTool` | Hide the `mcp` proxy tool once configured direct tools are fully available from cache. |
 | `autoAuth` | Auto-run OAuth on `connect`/tool calls when a server needs auth, then retry once (default: false). |
@@ -271,7 +271,7 @@ Direct tools default to deferred loading: Pi registers them as provider-native d
 
 Eager direct tools cost ~150-300 tokens each in the system prompt (name + description + schema). Good for targeted sets of 5-20 tools. For servers with 75+ tools, keep the default deferred loading, stick with the proxy, or pick specific tools with a `string[]`.
 
-Direct tools register from the metadata cache in the Pi agent dir (`~/.pi/agent/mcp-cache.json` by default, or `$PI_CODING_AGENT_DIR/mcp-cache.json` when set), so no server connections are needed at startup. On the first session after adding `directTools` to a new server, the cache won't exist yet — tools fall back to proxy-only and the cache populates in the background. To force it: `/mcp reconnect <server>`.
+Direct tools register from the metadata cache in the Pi agent dir (`~/.pi/agent/mcp-cache.json` by default, or `$PI_CODING_AGENT_DIR/mcp-cache.json` when set), so no server connections are needed at startup. On the first session after adding `directTools`, after a server config change that invalidates the cache hash, or after metadata expires, those tools are not registered yet. Startup warns with the server name and configured tool names when known (including a global `settings.directTools` array, or that names are unknown until discovery), warms metadata, and tells you to restart after a successful warm. Discovery or OAuth failures are reported as errors with a next action; they do not echo raw SDK error text. `MCP_DIRECT_TOOLS=__none__` still disables direct tools with no extra warning. To force a refresh: `/mcp reconnect <server>`.
 
 When you change direct-tool toggles in `/mcp` or write new config through `/mcp setup`, the extension triggers Pi's normal reload flow automatically. That refreshes extensions, prompts, skills, and MCP tool registration in one shot, so newly configured direct tools can appear without a manual restart.
 

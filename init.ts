@@ -21,7 +21,10 @@ import { buildToolMetadata, totalToolCount } from "./tool-metadata.ts";
 import { UiResourceHandler } from "./ui-resource-handler.ts";
 import { openUrl, parallelLimit } from "./utils.ts";
 import { logger } from "./logger.ts";
-import { getMissingConfiguredDirectToolServers } from "./direct-tools.ts";
+import {
+  formatDirectToolUnavailabilityMessage,
+  getConfiguredDirectToolCacheGaps,
+} from "./direct-tools.ts";
 
 const FAILURE_BACKOFF_MS = 60 * 1000;
 
@@ -172,35 +175,44 @@ export async function initializeMcp(
   }
 
   const envDirect = process.env.MCP_DIRECT_TOOLS;
-  if (envDirect !== "__none__") {
-    const currentCache = loadMetadataCache();
-    const missingCacheServers = getMissingConfiguredDirectToolServers(config, currentCache);
+  const initialDirectGaps = envDirect === "__none__"
+    ? []
+    : getConfiguredDirectToolCacheGaps(config, cache);
 
-    if (missingCacheServers.length > 0) {
-      const bootstrapResults = await parallelLimit(
-        missingCacheServers.filter(name => !results.some(r => r.name === name && r.connection)),
-        10,
-        async (name) => {
-          const definition = config.mcpServers[name];
-          try {
-            const connection = await manager.connect(name, definition);
-            if (connection.status === "needs-auth") {
-              return { name, ok: false };
-            }
-            const { metadata } = buildToolMetadata(connection.tools, connection.resources, definition, name, prefix);
-            toolMetadata.set(name, metadata);
-            updateMetadataCache(state, name);
-            return { name, ok: true };
-          } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            logger.debug(`MCP: direct-tools bootstrap failed for ${name}: ${message}`);
-            return { name, ok: false };
-          }
-        },
-      );
-      const bootstrapped = bootstrapResults.filter(r => r.ok).map(r => r.name);
-      if (bootstrapped.length > 0 && ctx.hasUI) {
-        ctx.ui.notify(`MCP: direct tools for ${bootstrapped.join(", ")} will be available after restart`, "info");
+  if (initialDirectGaps.length > 0) {
+    const pendingGaps = initialDirectGaps.filter(
+      gap => !results.some(result => result.name === gap.serverName && result.connection),
+    );
+    const bootstrapResults = await parallelLimit(pendingGaps, 10, async (gap) => {
+      const definition = config.mcpServers[gap.serverName];
+      try {
+        const connection = await manager.connect(gap.serverName, definition);
+        if (connection.status === "needs-auth") {
+          return { gap, outcome: { serverName: gap.serverName, status: "needs-auth" as const } };
+        }
+        const { metadata } = buildToolMetadata(connection.tools, connection.resources, definition, gap.serverName, prefix);
+        toolMetadata.set(gap.serverName, metadata);
+        updateMetadataCache(state, gap.serverName);
+        return { gap, outcome: { serverName: gap.serverName, status: "warmed" as const } };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        logger.debug(`MCP: direct-tools bootstrap failed for ${gap.serverName}: ${message}`);
+        return { gap, outcome: { serverName: gap.serverName, status: "failed" as const } };
+      }
+    });
+
+    const alreadyWarmed = initialDirectGaps
+      .filter(gap => results.some(result => result.name === gap.serverName && result.connection))
+      .map(gap => ({ gap, outcome: { serverName: gap.serverName, status: "warmed" as const } }));
+
+    for (const { gap, outcome } of [...alreadyWarmed, ...bootstrapResults]) {
+      const { level, message } = formatDirectToolUnavailabilityMessage(gap, outcome);
+      if (level === "error") {
+        console.error(message);
+        if (ctx.hasUI) ctx.ui.notify(message, "error");
+      } else {
+        console.warn(message);
+        if (ctx.hasUI) ctx.ui.notify(message, "warning");
       }
     }
   }
