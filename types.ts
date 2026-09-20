@@ -330,7 +330,8 @@ export interface ServerEntry {
 export interface McpSettings {
   toolPrefix?: "server" | "none" | "short";
   idleTimeout?: number; // minutes, default 10, 0 to disable
-  directTools?: boolean;
+  /** Global default for all servers. A string[] keeps configured names in diagnostics and registration. */
+  directTools?: boolean | string[];
   /** Global default for direct MCP tool loading. Defaults to "deferred". */
   directToolLoading?: DirectToolLoading;
   disableProxyTool?: boolean;

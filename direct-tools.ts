@@ -4,7 +4,7 @@ import type { McpExtensionState } from "./state.ts";
 import type { DirectToolLoading, DirectToolSpec, McpConfig, McpContent } from "./types.ts";
 import type { MetadataCache } from "./metadata-cache.ts";
 import { lazyConnect, getFailureAgeSeconds } from "./init.ts";
-import { isServerCacheValid } from "./metadata-cache.ts";
+import { getServerCacheInvalidReason, isServerCacheValid, type ServerCacheInvalidReason } from "./metadata-cache.ts";
 import { formatSchema } from "./tool-metadata.ts";
 import { transformMcpContent } from "./tool-registrar.ts";
 import { maybeStartUiSession, type UiSessionRuntime } from "./ui-session.ts";
@@ -124,7 +124,6 @@ export function resolveDirectTools(
     }
   }
 
-  const globalDirect = config.settings?.directTools;
   const globalLoading = normalizeDirectToolLoading(config.settings?.directToolLoading) ?? "deferred";
 
   for (const [serverName, definition] of Object.entries(config.mcpServers)) {
@@ -140,11 +139,7 @@ export function resolveDirectTools(
         toolFilter = [...envTools.get(serverName)!];
       }
     } else {
-      if (definition.directTools !== undefined) {
-        toolFilter = definition.directTools;
-      } else if (globalDirect) {
-        toolFilter = globalDirect;
-      }
+      toolFilter = configuredDirectToolFilter(config, serverName);
     }
 
     if (!toolFilter) continue;
@@ -206,7 +201,11 @@ export function resolveDirectTools(
   return specs;
 }
 
-export type DirectToolCacheMissReason = "missing-cache" | "invalid-cache";
+export type DirectToolCacheMissReason =
+  | "missing-cache"
+  | "invalid-cache"
+  | "expired-cache"
+  | "unusable-cache";
 
 export interface DirectToolCacheGap {
   serverName: string;
@@ -218,7 +217,7 @@ export interface DirectToolCacheGap {
 export type DirectToolBootstrapOutcome =
   | { serverName: string; status: "warmed" }
   | { serverName: string; status: "needs-auth" }
-  | { serverName: string; status: "failed"; message: string };
+  | { serverName: string; status: "failed" };
 
 function configuredDirectToolFilter(
   config: McpConfig,
@@ -227,10 +226,29 @@ function configuredDirectToolFilter(
   const definition = config.mcpServers[serverName];
   if (!definition) return false;
   if (definition.directTools !== undefined) {
-    if (!definition.directTools) return false;
     return definition.directTools;
   }
-  return config.settings?.directTools ? true : false;
+  const globalDirect = config.settings?.directTools;
+  if (!globalDirect) return false;
+  return globalDirect;
+}
+
+function toCacheGapReason(reason: ServerCacheInvalidReason): DirectToolCacheMissReason {
+  switch (reason) {
+    case "missing": return "missing-cache";
+    case "hash-mismatch": return "invalid-cache";
+    case "expired": return "expired-cache";
+    case "unusable": return "unusable-cache";
+  }
+}
+
+function cacheMissReasonText(reason: DirectToolCacheMissReason): string {
+  switch (reason) {
+    case "missing-cache": return "no metadata cache";
+    case "invalid-cache": return "config hash does not match cache";
+    case "expired-cache": return "metadata cache expired";
+    case "unusable-cache": return "metadata cache is unusable";
+  }
 }
 
 export function getConfiguredDirectToolCacheGaps(
@@ -243,14 +261,13 @@ export function getConfiguredDirectToolCacheGaps(
     const configuredTools = configuredDirectToolFilter(config, serverName);
     if (!configuredTools) continue;
 
-    const serverCache = cache?.servers?.[serverName];
-    if (!serverCache) {
-      gaps.push({ serverName, reason: "missing-cache", configuredTools });
-      continue;
-    }
-    if (!isServerCacheValid(serverCache, definition)) {
-      gaps.push({ serverName, reason: "invalid-cache", configuredTools });
-    }
+    const invalid = getServerCacheInvalidReason(cache?.servers?.[serverName], definition);
+    if (!invalid) continue;
+    gaps.push({
+      serverName,
+      reason: toCacheGapReason(invalid),
+      configuredTools,
+    });
   }
 
   return gaps;
@@ -267,13 +284,10 @@ export function formatDirectToolUnavailabilityMessage(
   gap: DirectToolCacheGap,
   outcome: DirectToolBootstrapOutcome,
 ): { level: "warn" | "error"; message: string } {
-  const reason = gap.reason === "missing-cache"
-    ? "no metadata cache"
-    : "config hash does not match cache";
   const tools = gap.configuredTools === true
     ? "configured tool names unknown until discovery"
     : `configured tools: ${gap.configuredTools.join(", ")}`;
-  const prefix = `MCP: configured direct tools unavailable this session for "${gap.serverName}" (${reason}; ${tools}).`;
+  const prefix = `MCP: configured direct tools unavailable this session for "${gap.serverName}" (${cacheMissReasonText(gap.reason)}; ${tools}).`;
 
   if (outcome.status === "warmed") {
     return {
@@ -289,7 +303,7 @@ export function formatDirectToolUnavailabilityMessage(
   }
   return {
     level: "error",
-    message: `${prefix} Discovery failed: ${outcome.message}`,
+    message: `${prefix} Discovery failed: could not discover tools. Check the server command or URL, then retry or run /mcp reconnect ${gap.serverName}.`,
   };
 }
 

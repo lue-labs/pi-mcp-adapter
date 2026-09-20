@@ -10,7 +10,9 @@ import { resourceNameToToolName } from "./resource-tools.ts";
 import { extractToolUiStreamMode, interpolateEnvRecord, resolveBearerToken, resolveConfigPath } from "./utils.ts";
 
 const CACHE_VERSION = 1;
-const CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+export const CACHE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+export type ServerCacheInvalidReason = "missing" | "hash-mismatch" | "expired" | "unusable";
 
 export interface CachedTool {
   name: string;
@@ -102,15 +104,24 @@ export function computeServerHash(definition: ServerEntry): string {
   return createHash("sha256").update(normalized).digest("hex");
 }
 
+export function getServerCacheInvalidReason(
+  entry: ServerCacheEntry | undefined | null,
+  definition: ServerEntry,
+  maxAgeMs: number = CACHE_MAX_AGE_MS,
+): ServerCacheInvalidReason | null {
+  if (!entry) return "missing";
+  if (entry.configHash !== computeServerHash(definition)) return "hash-mismatch";
+  if (!entry.cachedAt || typeof entry.cachedAt !== "number") return "unusable";
+  if (maxAgeMs > 0 && Date.now() - entry.cachedAt > maxAgeMs) return "expired";
+  return null;
+}
+
 export function isServerCacheValid(
   entry: ServerCacheEntry,
   definition: ServerEntry,
   maxAgeMs: number = CACHE_MAX_AGE_MS
 ): boolean {
-  if (!entry || entry.configHash !== computeServerHash(definition)) return false;
-  if (!entry.cachedAt || typeof entry.cachedAt !== "number") return false;
-  if (maxAgeMs > 0 && Date.now() - entry.cachedAt > maxAgeMs) return false;
-  return true;
+  return getServerCacheInvalidReason(entry, definition, maxAgeMs) === null;
 }
 
 export function reconstructToolMetadata(

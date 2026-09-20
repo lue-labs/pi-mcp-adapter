@@ -197,7 +197,7 @@ export async function initializeMcp(
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         logger.debug(`MCP: direct-tools bootstrap failed for ${gap.serverName}: ${message}`);
-        return { gap, outcome: { serverName: gap.serverName, status: "failed" as const, message } };
+        return { gap, outcome: { serverName: gap.serverName, status: "failed" as const } };
       }
     });
 

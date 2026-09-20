@@ -10,7 +10,14 @@ import {
   getMissingConfiguredDirectToolServers,
   resolveDirectTools,
 } from "../direct-tools.ts";
-import { computeServerHash, loadMetadataCache, saveMetadataCache, type MetadataCache } from "../metadata-cache.ts";
+import {
+  CACHE_MAX_AGE_MS,
+  computeServerHash,
+  loadMetadataCache,
+  saveMetadataCache,
+  type MetadataCache,
+} from "../metadata-cache.ts";
+import { McpServerManager } from "../server-manager.ts";
 import type { McpConfig, ServerEntry } from "../types.ts";
 
 const mocks = vi.hoisted(() => ({
@@ -99,6 +106,13 @@ function diagnosticText(warn: ReturnType<typeof vi.spyOn>, error: ReturnType<typ
   ].join("\n");
 }
 
+function newDiagnosticText(warn: ReturnType<typeof vi.spyOn>, error: ReturnType<typeof vi.spyOn>, notify?: ReturnType<typeof vi.fn>): string {
+  return diagnosticText(warn, error, notify)
+    .split("\n")
+    .filter(line => line.includes("configured direct tools unavailable"))
+    .join("\n");
+}
+
 describe("direct-tool cache diagnostics", () => {
   let agentDir = "";
   let warn: ReturnType<typeof vi.spyOn>;
@@ -168,6 +182,77 @@ describe("direct-tool cache diagnostics", () => {
       const message = formatDirectToolUnavailabilityMessage(gaps[0]!, { serverName: "demo", status: "warmed" }).message;
       expect(message).toContain("configured tool names unknown until discovery");
       expect(message).not.toContain(STALE_TOOL);
+    });
+
+    it("preserves a global directTools array and per-server true/false overrides without quoting stale names", () => {
+      const staleEntry = {
+        configHash: "stale-hash",
+        cachedAt: Date.now(),
+        tools: [{ name: STALE_TOOL, description: "stale" }],
+        resources: [] as [],
+      };
+      const config: McpConfig = {
+        settings: { directTools: ["search"] },
+        mcpServers: {
+          fromGlobal: { command: process.execPath, args: ["-e", "process.exit(1)"] },
+          optedOut: { command: process.execPath, args: ["-e", "process.exit(1)"], directTools: false },
+          allTools: { command: process.execPath, args: ["-e", "process.exit(1)"], directTools: true },
+          named: { command: process.execPath, args: ["-e", "process.exit(1)"], directTools: ["list"] },
+        },
+      };
+      const stale: MetadataCache = {
+        version: 1,
+        servers: {
+          fromGlobal: staleEntry,
+          optedOut: staleEntry,
+          allTools: staleEntry,
+          named: staleEntry,
+        },
+      };
+
+      expect(getConfiguredDirectToolCacheGaps(config, stale)).toEqual([
+        { serverName: "fromGlobal", reason: "invalid-cache", configuredTools: ["search"] },
+        { serverName: "allTools", reason: "invalid-cache", configuredTools: true },
+        { serverName: "named", reason: "invalid-cache", configuredTools: ["list"] },
+      ]);
+      const messages = getConfiguredDirectToolCacheGaps(config, stale).map(
+        gap => formatDirectToolUnavailabilityMessage(gap, { serverName: gap.serverName, status: "warmed" }).message,
+      );
+      expect(messages.join("\n")).toContain("configured tools: search");
+      expect(messages.join("\n")).toContain("configured tools: list");
+      expect(messages.join("\n")).toContain("configured tool names unknown until discovery");
+      expect(messages.join("\n")).not.toContain(STALE_TOOL);
+      expect(messages.join("\n")).not.toContain("optedOut");
+    });
+
+    it("describes same-hash expired cache as expired, not a hash mismatch", () => {
+      const definition = fixtureDefinition();
+      const config: McpConfig = {
+        mcpServers: { demo: definition },
+      };
+      const expired: MetadataCache = {
+        version: 1,
+        servers: {
+          demo: {
+            configHash: computeServerHash(definition),
+            cachedAt: Date.now() - CACHE_MAX_AGE_MS - 1,
+            tools: [{ name: STALE_TOOL, description: "stale" }],
+            resources: [],
+          },
+        },
+      };
+
+      expect(getConfiguredDirectToolCacheGaps(config, expired)).toEqual([
+        { serverName: "demo", reason: "expired-cache", configuredTools: ["search", "list"] },
+      ]);
+      const message = formatDirectToolUnavailabilityMessage(
+        getConfiguredDirectToolCacheGaps(config, expired)[0]!,
+        { serverName: "demo", status: "warmed" },
+      ).message;
+      expect(message).toContain("metadata cache expired");
+      expect(message).not.toContain("config hash does not match cache");
+      expect(message).not.toContain(STALE_TOOL);
+      expect(resolveDirectTools(config, expired, "server")).toEqual([]);
     });
   });
 
@@ -265,6 +350,36 @@ describe("direct-tool cache diagnostics", () => {
       expect(states[0]?.manager.getConnection("demo")).toBeUndefined();
     });
 
+    it("reports same-hash expired cache without calling it a hash mismatch", async () => {
+      const definition = fixtureDefinition();
+      const config: McpConfig = {
+        settings: { idleTimeout: 0 },
+        mcpServers: { demo: definition },
+      };
+      saveMetadataCache({
+        version: 1,
+        servers: {
+          demo: {
+            configHash: computeServerHash(definition),
+            cachedAt: Date.now() - CACHE_MAX_AGE_MS - 1,
+            tools: [{ name: STALE_TOOL, description: "stale" }],
+            resources: [],
+          },
+        },
+      });
+
+      const { notify } = await runInit(config, true);
+      const text = newDiagnosticText(warn, error, notify);
+
+      expect(text).toContain("metadata cache expired");
+      expect(text).not.toContain("config hash does not match cache");
+      expect(text).toContain("configured tools: search, list");
+      expect(text).toContain("Metadata warm succeeded; restart to register them.");
+      expect(text).not.toContain(STALE_TOOL);
+      expect(text).not.toContain(SECRET);
+      expect(notify).toHaveBeenCalledWith(expect.stringContaining("metadata cache expired"), "warning");
+    });
+
     it("reports failed discovery without leaking secrets", async () => {
       const definition = crashingDefinition({ directTools: ["search"] });
       const config: McpConfig = {
@@ -274,13 +389,50 @@ describe("direct-tool cache diagnostics", () => {
       saveMetadataCache({ version: 1, servers: {} });
 
       const { notify } = await runInit(config, false);
-      const text = diagnosticText(warn, error, notify);
+      const text = newDiagnosticText(warn, error, notify);
 
       expect(text).toContain('"demo"');
-      expect(text).toContain("Discovery failed:");
+      expect(text).toContain("Discovery failed: could not discover tools");
+      expect(text).toContain("/mcp reconnect demo");
       expect(text).toContain("configured tools: search");
       expect(text).not.toContain(SECRET);
       expect(getMissingConfiguredDirectToolServers(config, loadMetadataCache())).toEqual(["demo"]);
+    });
+
+    it("does not interpolate untrusted connect error text into the new diagnostic", async () => {
+      const leakPassword = "leak-password";
+      const leakQuery = "leak-query-token";
+      const leakBody = "HTTP_BODY_SENTINEL_DO_NOT_ECHO";
+      const connectError = new Error(
+        `fetch failed: https://user:${leakPassword}@evil.example/mcp?token=${leakQuery} body=${leakBody}\n    at Client.connect (sdk.js:1:1)`,
+      );
+      const connectSpy = vi.spyOn(McpServerManager.prototype, "connect").mockRejectedValue(connectError);
+      try {
+        const definition = crashingDefinition({ directTools: ["search"] });
+        const config: McpConfig = {
+          settings: { idleTimeout: 0 },
+          mcpServers: { demo: definition },
+        };
+        saveMetadataCache({ version: 1, servers: {} });
+
+        const { notify } = await runInit(config, true);
+        const text = newDiagnosticText(warn, error, notify);
+
+        expect(text).toContain('"demo"');
+        expect(text).toContain("Discovery failed: could not discover tools");
+        expect(text).toContain("Check the server command or URL");
+        expect(text).toContain("/mcp reconnect demo");
+        expect(notify).toHaveBeenCalledWith(expect.stringContaining("Discovery failed: could not discover tools"), "error");
+        expect(text).not.toContain(leakPassword);
+        expect(text).not.toContain(leakQuery);
+        expect(text).not.toContain(leakBody);
+        expect(text).not.toContain("user:");
+        expect(text).not.toContain("evil.example");
+        expect(text).not.toContain("sdk.js");
+        expect(text).not.toContain("fetch failed");
+      } finally {
+        connectSpy.mockRestore();
+      }
     });
 
     it("reports auth discovery failure distinctly from a successful warm", async () => {
