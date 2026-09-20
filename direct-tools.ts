@@ -206,27 +206,91 @@ export function resolveDirectTools(
   return specs;
 }
 
+export type DirectToolCacheMissReason = "missing-cache" | "invalid-cache";
+
+export interface DirectToolCacheGap {
+  serverName: string;
+  reason: DirectToolCacheMissReason;
+  /** Configured tool names when `directTools` is a string[]; `true` means all tools (names unknown). */
+  configuredTools: true | string[];
+}
+
+export type DirectToolBootstrapOutcome =
+  | { serverName: string; status: "warmed" }
+  | { serverName: string; status: "needs-auth" }
+  | { serverName: string; status: "failed"; message: string };
+
+function configuredDirectToolFilter(
+  config: McpConfig,
+  serverName: string,
+): true | string[] | false {
+  const definition = config.mcpServers[serverName];
+  if (!definition) return false;
+  if (definition.directTools !== undefined) {
+    if (!definition.directTools) return false;
+    return definition.directTools;
+  }
+  return config.settings?.directTools ? true : false;
+}
+
+export function getConfiguredDirectToolCacheGaps(
+  config: McpConfig,
+  cache: MetadataCache | null,
+): DirectToolCacheGap[] {
+  const gaps: DirectToolCacheGap[] = [];
+
+  for (const [serverName, definition] of Object.entries(config.mcpServers)) {
+    const configuredTools = configuredDirectToolFilter(config, serverName);
+    if (!configuredTools) continue;
+
+    const serverCache = cache?.servers?.[serverName];
+    if (!serverCache) {
+      gaps.push({ serverName, reason: "missing-cache", configuredTools });
+      continue;
+    }
+    if (!isServerCacheValid(serverCache, definition)) {
+      gaps.push({ serverName, reason: "invalid-cache", configuredTools });
+    }
+  }
+
+  return gaps;
+}
+
 export function getMissingConfiguredDirectToolServers(
   config: McpConfig,
   cache: MetadataCache | null,
 ): string[] {
-  const missing: string[] = [];
-  const globalDirect = config.settings?.directTools;
+  return getConfiguredDirectToolCacheGaps(config, cache).map(gap => gap.serverName);
+}
 
-  for (const [serverName, definition] of Object.entries(config.mcpServers)) {
-    const hasDirectTools = definition.directTools !== undefined
-      ? !!definition.directTools
-      : !!globalDirect;
+export function formatDirectToolUnavailabilityMessage(
+  gap: DirectToolCacheGap,
+  outcome: DirectToolBootstrapOutcome,
+): { level: "warn" | "error"; message: string } {
+  const reason = gap.reason === "missing-cache"
+    ? "no metadata cache"
+    : "config hash does not match cache";
+  const tools = gap.configuredTools === true
+    ? "configured tool names unknown until discovery"
+    : `configured tools: ${gap.configuredTools.join(", ")}`;
+  const prefix = `MCP: configured direct tools unavailable this session for "${gap.serverName}" (${reason}; ${tools}).`;
 
-    if (!hasDirectTools) continue;
-
-    const serverCache = cache?.servers?.[serverName];
-    if (!serverCache || !isServerCacheValid(serverCache, definition)) {
-      missing.push(serverName);
-    }
+  if (outcome.status === "warmed") {
+    return {
+      level: "warn",
+      message: `${prefix} Metadata warm succeeded; restart to register them.`,
+    };
   }
-
-  return missing;
+  if (outcome.status === "needs-auth") {
+    return {
+      level: "error",
+      message: `${prefix} Discovery failed: OAuth authentication required. Run /mcp-auth ${gap.serverName}.`,
+    };
+  }
+  return {
+    level: "error",
+    message: `${prefix} Discovery failed: ${outcome.message}`,
+  };
 }
 
 export function buildProxyDescription(
