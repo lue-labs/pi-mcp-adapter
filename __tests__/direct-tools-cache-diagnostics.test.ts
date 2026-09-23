@@ -8,6 +8,7 @@ import {
   formatDirectToolUnavailabilityMessage,
   getConfiguredDirectToolCacheGaps,
   getMissingConfiguredDirectToolServers,
+  parseDirectToolsEnvOverride,
   resolveDirectTools,
 } from "../direct-tools.ts";
 import {
@@ -450,6 +451,192 @@ describe("direct-tool cache diagnostics", () => {
       expect(warmed.level).toBe("warn");
       expect(warmed.message).toContain("Metadata warm succeeded; restart to register them.");
       expect(warmed.message).not.toContain("Discovery failed");
+    });
+  });
+
+  describe("directTools: true discovered names (issue #1420)", () => {
+    const UNKNOWN = "configured tool names unknown until discovery";
+
+    async function runInit(config: McpConfig, hasUI: boolean) {
+      mocks.loadMcpConfig.mockReturnValue(config);
+      const { initializeMcp } = await import("../init.ts");
+      const { ctx, notify } = context(hasUI);
+      const state = await initializeMcp(extensionApi(), ctx);
+      states.push(state);
+      return { state, notify };
+    }
+
+    function staleCache(name: string, previous: ServerEntry): MetadataCache {
+      return {
+        version: 1,
+        servers: {
+          [name]: {
+            configHash: computeServerHash(previous),
+            cachedAt: Date.now(),
+            tools: [{ name: STALE_TOOL, description: "stale" }],
+            resources: [],
+          },
+        },
+      };
+    }
+
+    it("formats old (no discovery info) vs new (discovered names) warmed outcomes for the same gap", () => {
+      const gap = { serverName: "demo", reason: "missing-cache" as const, configuredTools: true as const };
+      const oldStyle = formatDirectToolUnavailabilityMessage(gap, { serverName: "demo", status: "warmed" });
+      const named = formatDirectToolUnavailabilityMessage(gap, { serverName: "demo", status: "warmed", discoveredTools: ["search", "list"] });
+      const none = formatDirectToolUnavailabilityMessage(gap, { serverName: "demo", status: "warmed", discoveredTools: [] });
+
+      expect(oldStyle.message).toContain(UNKNOWN);
+      expect(named).toEqual({
+        level: "warn",
+        message: 'MCP: configured direct tools unavailable this session for "demo" (no metadata cache; directTools: true; discovered tools: search, list). Metadata warm succeeded; restart to register them.',
+      });
+      expect(none.level).toBe("warn");
+      expect(none.message).toContain("discovered no eligible tools");
+      expect(none.message).toContain("no direct tools to register");
+      expect(none.message).not.toContain("restart to register them");
+    });
+
+    it("keeps explicit string[] names authoritative and failed discovery names unknown", () => {
+      const listed = formatDirectToolUnavailabilityMessage(
+        { serverName: "demo", reason: "invalid-cache", configuredTools: ["search"] },
+        { serverName: "demo", status: "warmed", discoveredTools: ["search", "list"] },
+      );
+      expect(listed.message).toContain("configured tools: search)");
+      expect(listed.message).not.toContain("discovered");
+
+      const gap = { serverName: "demo", reason: "missing-cache" as const, configuredTools: true as const };
+      const failed = formatDirectToolUnavailabilityMessage(gap, { serverName: "demo", status: "failed" });
+      const auth = formatDirectToolUnavailabilityMessage(gap, { serverName: "demo", status: "needs-auth" });
+      for (const result of [failed, auth]) {
+        expect(result.level).toBe("error");
+        expect(result.message).toContain(UNKNOWN);
+        expect(result.message).not.toContain("discovered tools");
+      }
+    });
+
+    it("names discovered tools on a first-session cache miss (no cache file), then registers them silently next session", async () => {
+      const definition = fixtureDefinition({ directTools: true });
+      const config: McpConfig = { settings: { idleTimeout: 0 }, mcpServers: { demo: definition } };
+
+      const { notify } = await runInit(config, false);
+      const text = newDiagnosticText(warn, error, notify);
+      expect(text).toContain('"demo" (no metadata cache; directTools: true; discovered tools: search, list). Metadata warm succeeded; restart to register them.');
+      expect(text).not.toContain(UNKNOWN);
+      expect(text).not.toContain(SECRET);
+
+      const cacheAfterWarm = loadMetadataCache();
+      await Promise.all(states.splice(0).map(state => state.lifecycle.gracefulShutdown()));
+      warn.mockClear();
+      error.mockClear();
+
+      const next = await runInit(config, false);
+      expect(newDiagnosticText(warn, error, next.notify)).toBe("");
+      expect(loadMetadataCache()?.servers.demo?.configHash).toBe(cacheAfterWarm?.servers.demo?.configHash);
+      expect(resolveDirectTools(config, loadMetadataCache(), "server").map(spec => spec.prefixedName)).toEqual(["demo_search", "demo_list"]);
+      expect(next.state.manager.getConnection("demo")).toBeUndefined();
+    });
+
+    it("names discovered tools on a config-hash change via the bootstrap path, never stale cached names", async () => {
+      const current = fixtureDefinition({ directTools: true });
+      const config: McpConfig = { settings: { idleTimeout: 0 }, mcpServers: { demo: current } };
+      saveMetadataCache(staleCache("demo", fixtureDefinition({ directTools: true, args: [fixture, "--old"] })));
+
+      const { notify } = await runInit(config, true);
+      const text = newDiagnosticText(warn, error, notify);
+      expect(text).toContain('"demo" (config hash does not match cache; directTools: true; discovered tools: search, list). Metadata warm succeeded; restart to register them.');
+      expect(text).not.toContain(STALE_TOOL);
+      expect(text).not.toContain(UNKNOWN);
+      expect(notify).toHaveBeenCalledWith(expect.stringContaining("discovered tools: search, list"), "warning");
+      expect(getMissingConfiguredDirectToolServers(config, loadMetadataCache())).toEqual([]);
+      expect(resolveDirectTools(config, loadMetadataCache(), "server").map(spec => spec.originalName)).toEqual(["search", "list"]);
+    });
+
+    it("handles true and explicit-list servers together and matches next-session registration filters", async () => {
+      const config: McpConfig = {
+        settings: { idleTimeout: 0, directTools: true },
+        mcpServers: {
+          wild: fixtureDefinition({ directTools: undefined, excludeTools: ["list"] }),
+          named: fixtureDefinition({ directTools: ["search"] }),
+          broken: crashingDefinition(),
+        },
+      };
+      saveMetadataCache({ version: 1, servers: {} });
+
+      const { notify } = await runInit(config, false);
+      const text = newDiagnosticText(warn, error, notify);
+      expect(text).toContain('"wild" (no metadata cache; directTools: true; discovered tools: search). Metadata warm succeeded; restart to register them.');
+      expect(text).toContain('"named" (no metadata cache; configured tools: search). Metadata warm succeeded; restart to register them.');
+      expect(text).toContain(`"broken" (no metadata cache; ${UNKNOWN}). Discovery failed: could not discover tools.`);
+      expect(text).not.toContain(SECRET);
+      expect(resolveDirectTools(config, loadMetadataCache(), "server").map(spec => spec.prefixedName)).toEqual(["wild_search", "named_search"]);
+    });
+
+    function skipWarnings(): string[] {
+      return warn.mock.calls.map(args => String(args[0])).filter(line => line.includes("skipping"));
+    }
+
+    function nextSessionNames(config: McpConfig, prefix: "server" | "none" | "short") {
+      const env = process.env.MCP_DIRECT_TOOLS;
+      return resolveDirectTools(config, loadMetadataCache(), prefix, parseDirectToolsEnvOverride(env))
+        .map(spec => `${spec.serverName}:${spec.prefixedName}`);
+    }
+
+    it("applies the MCP_DIRECT_TOOLS override exactly like next-session registration", async () => {
+      process.env.MCP_DIRECT_TOOLS = " wild/search , ";
+      const config: McpConfig = {
+        settings: { idleTimeout: 0 },
+        mcpServers: {
+          wild: fixtureDefinition({ directTools: true }),
+          other: fixtureDefinition({ directTools: true, args: [fixture, "--other"] }),
+        },
+      };
+
+      const { notify } = await runInit(config, false);
+      const text = newDiagnosticText(warn, error, notify);
+      expect(text).toContain('"wild" (no metadata cache; directTools: true; discovered tools: search). Metadata warm succeeded; restart to register them.');
+      expect(text).not.toContain("discovered tools: search, list");
+      expect(text).toContain('"other" (no metadata cache; directTools: true; discovered no eligible tools). Metadata warm succeeded; no direct tools to register.');
+      expect(nextSessionNames(config, "server")).toEqual(["wild:wild_search"]);
+    });
+
+    it.each([
+      { prefix: "none" as const, first: "a", second: "b", registered: ["a:search", "a:list"] },
+      { prefix: "short" as const, first: "demo", second: "demo-mcp", registered: ["demo:demo_search", "demo:demo_list"] },
+    ])("attributes cross-server duplicates (toolPrefix: $prefix) only to the server that registers them, without early skip warnings", async ({ prefix, first, second, registered }) => {
+      const config: McpConfig = {
+        settings: { idleTimeout: 0, toolPrefix: prefix, directTools: true },
+        mcpServers: {
+          [first]: fixtureDefinition({ directTools: undefined }),
+          [second]: fixtureDefinition({ directTools: undefined, args: [fixture, "--second"] }),
+        },
+      };
+
+      const { notify } = await runInit(config, false);
+      const text = newDiagnosticText(warn, error, notify);
+      expect(text).toContain(`"${first}" (no metadata cache; directTools: true; discovered tools: search, list). Metadata warm succeeded; restart to register them.`);
+      expect(text).toContain(`"${second}" (no metadata cache; directTools: true; discovered no eligible tools). Metadata warm succeeded; no direct tools to register.`);
+      expect(skipWarnings()).toEqual([]);
+
+      warn.mockClear();
+      expect(nextSessionNames(config, prefix)).toEqual(registered);
+      expect(skipWarnings()).toHaveLength(2);
+    });
+
+    it("omits builtin-colliding tools without emitting the startup collision warning during the warm session", async () => {
+      const config: McpConfig = {
+        settings: { idleTimeout: 0, toolPrefix: "none" },
+        mcpServers: { demo: fixtureDefinition({ directTools: true, args: [fixture, "--tools=read,search"] }) },
+      };
+
+      const { notify } = await runInit(config, false);
+      const text = newDiagnosticText(warn, error, notify);
+      expect(text).toContain('"demo" (no metadata cache; directTools: true; discovered tools: search). Metadata warm succeeded; restart to register them.');
+      expect(skipWarnings()).toEqual([]);
+
+      warn.mockClear();
+      expect(nextSessionNames(config, "none")).toEqual(["demo:search"]);
+      expect(skipWarnings()).toEqual(['MCP: skipping direct tool "read" (collides with builtin)']);
     });
   });
 });

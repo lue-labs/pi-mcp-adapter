@@ -99,6 +99,7 @@ export function resolveDirectTools(
   cache: MetadataCache | null,
   prefix: "server" | "none" | "short",
   envOverride?: string[],
+  warn: (message: string) => void = message => console.warn(message),
 ): DirectToolSpec[] {
   const specs: DirectToolSpec[] = [];
   if (!cache) return specs;
@@ -151,11 +152,11 @@ export function resolveDirectTools(
       if (isToolExcluded(tool.name, serverName, prefix, definition.excludeTools)) continue;
       const prefixedName = formatToolName(tool.name, serverName, prefix);
       if (BUILTIN_NAMES.has(prefixedName)) {
-        console.warn(`MCP: skipping direct tool "${prefixedName}" (collides with builtin)`);
+        warn(`MCP: skipping direct tool "${prefixedName}" (collides with builtin)`);
         continue;
       }
       if (seenNames.has(prefixedName)) {
-        console.warn(`MCP: skipping duplicate direct tool "${prefixedName}" from "${serverName}"`);
+        warn(`MCP: skipping duplicate direct tool "${prefixedName}" from "${serverName}"`);
         continue;
       }
       seenNames.add(prefixedName);
@@ -178,11 +179,11 @@ export function resolveDirectTools(
         if (isToolExcluded(baseName, serverName, prefix, definition.excludeTools)) continue;
         const prefixedName = formatToolName(baseName, serverName, prefix);
         if (BUILTIN_NAMES.has(prefixedName)) {
-          console.warn(`MCP: skipping direct resource tool "${prefixedName}" (collides with builtin)`);
+          warn(`MCP: skipping direct resource tool "${prefixedName}" (collides with builtin)`);
           continue;
         }
         if (seenNames.has(prefixedName)) {
-          console.warn(`MCP: skipping duplicate direct resource tool "${prefixedName}" from "${serverName}"`);
+          warn(`MCP: skipping duplicate direct resource tool "${prefixedName}" from "${serverName}"`);
           continue;
         }
         seenNames.add(prefixedName);
@@ -215,7 +216,8 @@ export interface DirectToolCacheGap {
 }
 
 export type DirectToolBootstrapOutcome =
-  | { serverName: string; status: "warmed" }
+  /** `discoveredTools`: direct tool names the warmed cache will register next session (for `directTools: true`). */
+  | { serverName: string; status: "warmed"; discoveredTools?: string[] }
   | { serverName: string; status: "needs-auth" }
   | { serverName: string; status: "failed" };
 
@@ -273,6 +275,31 @@ export function getConfiguredDirectToolCacheGaps(
   return gaps;
 }
 
+/** `MCP_DIRECT_TOOLS` parsed exactly as the startup registration in index.ts does (`__none__` handled by callers). */
+export function parseDirectToolsEnvOverride(raw: string | undefined): string[] | undefined {
+  return raw?.split(",").map(s => s.trim()).filter(Boolean);
+}
+
+/**
+ * Direct tool names each server would register from `cache` next session: resolved once over the
+ * full config (same env override, order, exclusion, builtin and cross-server duplicate rules as
+ * startup), with skip warnings suppressed so startup remains their only reporter.
+ */
+export function getDiscoveredDirectToolNamesByServer(
+  config: McpConfig,
+  cache: MetadataCache | null,
+  prefix: "server" | "none" | "short",
+  envOverride?: string[],
+): Map<string, string[]> {
+  const byServer = new Map<string, string[]>();
+  for (const spec of resolveDirectTools(config, cache, prefix, envOverride, () => {})) {
+    const names = byServer.get(spec.serverName) ?? [];
+    names.push(spec.originalName);
+    byServer.set(spec.serverName, names);
+  }
+  return byServer;
+}
+
 export function getMissingConfiguredDirectToolServers(
   config: McpConfig,
   cache: MetadataCache | null,
@@ -284,12 +311,22 @@ export function formatDirectToolUnavailabilityMessage(
   gap: DirectToolCacheGap,
   outcome: DirectToolBootstrapOutcome,
 ): { level: "warn" | "error"; message: string } {
-  const tools = gap.configuredTools === true
-    ? "configured tool names unknown until discovery"
-    : `configured tools: ${gap.configuredTools.join(", ")}`;
+  const discovered = gap.configuredTools === true && outcome.status === "warmed"
+    ? outcome.discoveredTools
+    : undefined;
+  const tools = gap.configuredTools !== true
+    ? `configured tools: ${gap.configuredTools.join(", ")}`
+    : !discovered
+      ? "configured tool names unknown until discovery"
+      : discovered.length > 0
+        ? `directTools: true; discovered tools: ${discovered.join(", ")}`
+        : "directTools: true; discovered no eligible tools";
   const prefix = `MCP: configured direct tools unavailable this session for "${gap.serverName}" (${cacheMissReasonText(gap.reason)}; ${tools}).`;
 
   if (outcome.status === "warmed") {
+    if (discovered && discovered.length === 0) {
+      return { level: "warn", message: `${prefix} Metadata warm succeeded; no direct tools to register.` };
+    }
     return {
       level: "warn",
       message: `${prefix} Metadata warm succeeded; restart to register them.`,
