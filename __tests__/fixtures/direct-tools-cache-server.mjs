@@ -11,20 +11,26 @@ const server = new Server(
   { capabilities: { tools: {}, resources: {} } },
 );
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
-    {
-      name: "search",
-      description: "Search items",
-      inputSchema: { type: "object", properties: { q: { type: "string" } } },
-    },
-    {
-      name: "list",
-      description: "List items",
-      inputSchema: { type: "object", properties: {} },
-    },
-  ],
-}));
+const defaultTools = [
+  {
+    name: "search",
+    description: "Search items",
+    inputSchema: { type: "object", properties: { q: { type: "string" } } },
+  },
+  {
+    name: "list",
+    description: "List items",
+    inputSchema: { type: "object", properties: {} },
+  },
+];
+// `--tools=a,b` replaces the default tools (e.g. to expose a builtin-colliding "read").
+const toolsArg = process.argv.find(arg => arg.startsWith("--tools="));
+const tools = toolsArg
+  ? toolsArg.slice("--tools=".length).split(",").filter(Boolean)
+    .map(name => ({ name, description: `${name} tool`, inputSchema: { type: "object", properties: {} } }))
+  : defaultTools;
+
+server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
 
 server.setRequestHandler(ListResourcesRequestSchema, async () => ({ resources: [] }));
 

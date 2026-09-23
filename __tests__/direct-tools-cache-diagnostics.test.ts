@@ -8,6 +8,7 @@ import {
   formatDirectToolUnavailabilityMessage,
   getConfiguredDirectToolCacheGaps,
   getMissingConfiguredDirectToolServers,
+  parseDirectToolsEnvOverride,
   resolveDirectTools,
 } from "../direct-tools.ts";
 import {
@@ -569,6 +570,73 @@ describe("direct-tool cache diagnostics", () => {
       expect(text).toContain(`"broken" (no metadata cache; ${UNKNOWN}). Discovery failed: could not discover tools.`);
       expect(text).not.toContain(SECRET);
       expect(resolveDirectTools(config, loadMetadataCache(), "server").map(spec => spec.prefixedName)).toEqual(["wild_search", "named_search"]);
+    });
+
+    function skipWarnings(): string[] {
+      return warn.mock.calls.map(args => String(args[0])).filter(line => line.includes("skipping"));
+    }
+
+    function nextSessionNames(config: McpConfig, prefix: "server" | "none" | "short") {
+      const env = process.env.MCP_DIRECT_TOOLS;
+      return resolveDirectTools(config, loadMetadataCache(), prefix, parseDirectToolsEnvOverride(env))
+        .map(spec => `${spec.serverName}:${spec.prefixedName}`);
+    }
+
+    it("applies the MCP_DIRECT_TOOLS override exactly like next-session registration", async () => {
+      process.env.MCP_DIRECT_TOOLS = " wild/search , ";
+      const config: McpConfig = {
+        settings: { idleTimeout: 0 },
+        mcpServers: {
+          wild: fixtureDefinition({ directTools: true }),
+          other: fixtureDefinition({ directTools: true, args: [fixture, "--other"] }),
+        },
+      };
+
+      const { notify } = await runInit(config, false);
+      const text = newDiagnosticText(warn, error, notify);
+      expect(text).toContain('"wild" (no metadata cache; directTools: true; discovered tools: search). Metadata warm succeeded; restart to register them.');
+      expect(text).not.toContain("discovered tools: search, list");
+      expect(text).toContain('"other" (no metadata cache; directTools: true; discovered no eligible tools). Metadata warm succeeded; no direct tools to register.');
+      expect(nextSessionNames(config, "server")).toEqual(["wild:wild_search"]);
+    });
+
+    it.each([
+      { prefix: "none" as const, first: "a", second: "b", registered: ["a:search", "a:list"] },
+      { prefix: "short" as const, first: "demo", second: "demo-mcp", registered: ["demo:demo_search", "demo:demo_list"] },
+    ])("attributes cross-server duplicates (toolPrefix: $prefix) only to the server that registers them, without early skip warnings", async ({ prefix, first, second, registered }) => {
+      const config: McpConfig = {
+        settings: { idleTimeout: 0, toolPrefix: prefix, directTools: true },
+        mcpServers: {
+          [first]: fixtureDefinition({ directTools: undefined }),
+          [second]: fixtureDefinition({ directTools: undefined, args: [fixture, "--second"] }),
+        },
+      };
+
+      const { notify } = await runInit(config, false);
+      const text = newDiagnosticText(warn, error, notify);
+      expect(text).toContain(`"${first}" (no metadata cache; directTools: true; discovered tools: search, list). Metadata warm succeeded; restart to register them.`);
+      expect(text).toContain(`"${second}" (no metadata cache; directTools: true; discovered no eligible tools). Metadata warm succeeded; no direct tools to register.`);
+      expect(skipWarnings()).toEqual([]);
+
+      warn.mockClear();
+      expect(nextSessionNames(config, prefix)).toEqual(registered);
+      expect(skipWarnings()).toHaveLength(2);
+    });
+
+    it("omits builtin-colliding tools without emitting the startup collision warning during the warm session", async () => {
+      const config: McpConfig = {
+        settings: { idleTimeout: 0, toolPrefix: "none" },
+        mcpServers: { demo: fixtureDefinition({ directTools: true, args: [fixture, "--tools=read,search"] }) },
+      };
+
+      const { notify } = await runInit(config, false);
+      const text = newDiagnosticText(warn, error, notify);
+      expect(text).toContain('"demo" (no metadata cache; directTools: true; discovered tools: search). Metadata warm succeeded; restart to register them.');
+      expect(skipWarnings()).toEqual([]);
+
+      warn.mockClear();
+      expect(nextSessionNames(config, "none")).toEqual(["demo:search"]);
+      expect(skipWarnings()).toEqual(['MCP: skipping direct tool "read" (collides with builtin)']);
     });
   });
 });
