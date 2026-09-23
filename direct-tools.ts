@@ -215,7 +215,8 @@ export interface DirectToolCacheGap {
 }
 
 export type DirectToolBootstrapOutcome =
-  | { serverName: string; status: "warmed" }
+  /** `discoveredTools`: direct tool names the warmed cache will register next session (for `directTools: true`). */
+  | { serverName: string; status: "warmed"; discoveredTools?: string[] }
   | { serverName: string; status: "needs-auth" }
   | { serverName: string; status: "failed" };
 
@@ -273,6 +274,19 @@ export function getConfiguredDirectToolCacheGaps(
   return gaps;
 }
 
+/** Direct tool names `serverName` would register from `cache` (same filter/exclusion rules as startup). */
+export function getDiscoveredDirectToolNames(
+  config: McpConfig,
+  cache: MetadataCache | null,
+  serverName: string,
+  prefix: "server" | "none" | "short",
+): string[] {
+  const definition = config.mcpServers[serverName];
+  if (!definition) return [];
+  const single: McpConfig = { ...config, mcpServers: { [serverName]: definition } };
+  return resolveDirectTools(single, cache, prefix).map(spec => spec.originalName);
+}
+
 export function getMissingConfiguredDirectToolServers(
   config: McpConfig,
   cache: MetadataCache | null,
@@ -284,12 +298,22 @@ export function formatDirectToolUnavailabilityMessage(
   gap: DirectToolCacheGap,
   outcome: DirectToolBootstrapOutcome,
 ): { level: "warn" | "error"; message: string } {
-  const tools = gap.configuredTools === true
-    ? "configured tool names unknown until discovery"
-    : `configured tools: ${gap.configuredTools.join(", ")}`;
+  const discovered = gap.configuredTools === true && outcome.status === "warmed"
+    ? outcome.discoveredTools
+    : undefined;
+  const tools = gap.configuredTools !== true
+    ? `configured tools: ${gap.configuredTools.join(", ")}`
+    : !discovered
+      ? "configured tool names unknown until discovery"
+      : discovered.length > 0
+        ? `directTools: true; discovered tools: ${discovered.join(", ")}`
+        : "directTools: true; discovered no eligible tools";
   const prefix = `MCP: configured direct tools unavailable this session for "${gap.serverName}" (${cacheMissReasonText(gap.reason)}; ${tools}).`;
 
   if (outcome.status === "warmed") {
+    if (discovered && discovered.length === 0) {
+      return { level: "warn", message: `${prefix} Metadata warm succeeded; no direct tools to register.` };
+    }
     return {
       level: "warn",
       message: `${prefix} Metadata warm succeeded; restart to register them.`,

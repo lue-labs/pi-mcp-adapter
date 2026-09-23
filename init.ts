@@ -14,6 +14,7 @@ import {
   saveMetadataCache,
   serializeResources,
   serializeTools,
+  type MetadataCache,
   type ServerCacheEntry,
 } from "./metadata-cache.ts";
 import { McpServerManager } from "./server-manager.ts";
@@ -24,6 +25,8 @@ import { logger } from "./logger.ts";
 import {
   formatDirectToolUnavailabilityMessage,
   getConfiguredDirectToolCacheGaps,
+  getDiscoveredDirectToolNames,
+  type DirectToolBootstrapOutcome,
 } from "./direct-tools.ts";
 
 const FAILURE_BACKOFF_MS = 60 * 1000;
@@ -205,7 +208,14 @@ export async function initializeMcp(
       .filter(gap => results.some(result => result.name === gap.serverName && result.connection))
       .map(gap => ({ gap, outcome: { serverName: gap.serverName, status: "warmed" as const } }));
 
-    for (const { gap, outcome } of [...alreadyWarmed, ...bootstrapResults]) {
+    // directTools: true has no configured names; name what the warmed cache will register next session.
+    let warmedCache: MetadataCache | null | undefined;
+    for (const { gap, outcome: rawOutcome } of [...alreadyWarmed, ...bootstrapResults]) {
+      let outcome: DirectToolBootstrapOutcome = rawOutcome;
+      if (outcome.status === "warmed" && gap.configuredTools === true) {
+        warmedCache ??= loadMetadataCache();
+        outcome = { ...outcome, discoveredTools: getDiscoveredDirectToolNames(config, warmedCache, gap.serverName, prefix) };
+      }
       const { level, message } = formatDirectToolUnavailabilityMessage(gap, outcome);
       if (level === "error") {
         console.error(message);
